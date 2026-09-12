@@ -327,12 +327,17 @@ def create_reading(ctx):
 
     - 常规读数：超限时自动生成事件并关联该产线当前在产批次（已放行批次不补挂）。
     - 携带 event_id：作为该事件的复测读数，不生成新事件；复测仍超限则事件继续拦截。
+
+    与批次放行在同一写事务（BEGIN IMMEDIATE）下串行化：超限读数与放行并发时，
+    要么事件先提交（放行被该事件拦截），要么放行先提交（事件关联不到已放行批次），
+    不会出现“已放行批次挂着未关闭事件”的不一致状态。
     """
     body = ctx.body
     point_id = to_int(require(body, "point_id", "监测点"), "point_id")
     value = to_float(require(body, "value", "读数值"), "读数值")
     recorded_by = opt_str(body, "recorded_by")
     conn = ctx.conn
+    conn.execute("BEGIN IMMEDIATE")
     point = conn.execute("SELECT * FROM monitoring_points WHERE id=?", (point_id,)).fetchone()
     if not point:
         raise ApiError(404, "POINT_NOT_FOUND", "监测点不存在")
@@ -423,12 +428,13 @@ def get_event(ctx):
 
 @route("POST", r"/api/events/(?P<id>\d+)/disposition")
 def disposition(ctx):
-    """质量人员记录原因与纠正措施。"""
+    """质量人员记录原因与纠正措施（写事务内校验事件状态）。"""
     body = ctx.body
     cause = str(require(body, "cause", "原因分析")).strip()
     measures = str(require(body, "measures", "纠正措施")).strip()
     operator = opt_str(body, "operator")
     conn = ctx.conn
+    conn.execute("BEGIN IMMEDIATE")
     ev = conn.execute("SELECT * FROM events WHERE id=?", (int(ctx.params["id"]),)).fetchone()
     if not ev:
         raise ApiError(404, "EVENT_NOT_FOUND", "事件不存在")
@@ -443,8 +449,12 @@ def disposition(ctx):
 
 @route("POST", r"/api/events/(?P<id>\d+)/close")
 def close_event(ctx):
-    """关闭事件：必须已记录原因措施，且最近一次复测合格。"""
+    """关闭事件：必须已记录原因措施，且最近一次复测合格。
+
+    校验与迁移在写事务内完成：与复测登记、其他关闭请求并发时结果一致。
+    """
     conn = ctx.conn
+    conn.execute("BEGIN IMMEDIATE")
     ev = conn.execute("SELECT * FROM events WHERE id=?", (int(ctx.params["id"]),)).fetchone()
     if not ev:
         raise ApiError(404, "EVENT_NOT_FOUND", "事件不存在")
@@ -497,11 +507,16 @@ def create_batch(ctx):
 def submit_release(ctx):
     """提交放行：存在未关闭（含复测仍超限）事件的批次一律拦截。
 
-    状态迁移为原子条件更新（WHERE status='in_production'）：并发提交同一批次时
-    仅一个请求生效，其余请求影响行数为 0，返回“已放行”提示。
+    “检查 + 状态迁移”在 BEGIN IMMEDIATE 写事务内完成，并配合原子条件更新
+    （WHERE status='in_production'）：
+    - 并发提交同一批次放行：仅一个请求成功，其余收到“已放行”提示；
+    - 与超限读数并发：要么放行被新生成的事件拦截，要么放行先提交、事件
+      关联不到已放行批次，两种结果都一致，不会同时出现。
     """
     conn = ctx.conn
     bid = int(ctx.params["id"])
+    operator = opt_str(ctx.body, "operator")
+    conn.execute("BEGIN IMMEDIATE")
     batch = conn.execute("SELECT * FROM batches WHERE id=?", (bid,)).fetchone()
     if not batch:
         raise ApiError(404, "BATCH_NOT_FOUND", "批次不存在")
@@ -518,7 +533,6 @@ def submit_release(ctx):
             f"批次 {batch['batch_no']} 存在 {len(events)} 个未关闭的超限事件，禁止提交放行",
             {"blocking_events": events},
         )
-    operator = opt_str(ctx.body, "operator")
     cur = conn.execute(
         "UPDATE batches SET status='released', released_at=?, released_by=? WHERE id=? AND status='in_production'",
         (now_str(), operator, bid),

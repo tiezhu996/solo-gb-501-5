@@ -4,7 +4,8 @@
 用法：python3 verify.py
 覆盖：页面真实渲染（node + 真实 app.js）、正常读数、超限自动事件、放行拦截、
       原因措施、复测仍超限继续拦截、复测合格后关闭、关闭后放行成功、
-      已放行批次不能补挂事件、并发提交放行仅一次成功、输入校验。
+      已放行批次不能补挂事件、并发提交放行仅一次成功、
+      超限读数与放行并发时拦截/分离二选一（多轮）、输入校验。
 """
 import json
 import os
@@ -81,6 +82,62 @@ def concurrent_release_check():
     check("并发提交放行：仅 1 次成功", len(oks) == 1, [x[0] for x in results])
     check("并发提交放行：其余 7 次收到已放行提示", len(already) == 7,
           [(x[0], x[1].get("error", {}).get("code")) for x in results])
+
+
+def reading_release_race_check(rounds=30):
+    """超限读数与批次放行并发（每轮新建批次、屏障同步发起）。
+
+    不变式：要么放行被事件拦截（409 BATCH_BLOCKED，事件挂在该批次上），
+    要么放行成功且事件未关联该已放行批次；绝不出现“放行成功且挂着未关闭事件”。
+    """
+    s, points = call("GET", "/api/points")
+    pts = {p["code"]: p for p in points["data"]["points"]}
+    point_id = pts["P-TEMP-01"]["id"]
+    outcomes = {"blocked": 0, "released_detached": 0}
+    bad = []
+    for i in range(rounds):
+        batch_no = f"B-RACE-{i:03d}"
+        s, r = call("POST", "/api/batches",
+                    {"line_id": 1, "batch_no": batch_no, "product_name": "竞态验证批次", "spec": "test"})
+        bid = r["data"]["batch"]["id"]
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def do_reading():
+            barrier.wait()
+            results["reading"] = call("POST", "/api/readings",
+                                      {"point_id": point_id, "value": 99.0, "recorded_by": "竞态测试"})
+
+        def do_release():
+            barrier.wait()
+            results["release"] = call("POST", f"/api/batches/{bid}/submit-release", {"operator": "王质量"})
+
+        t1 = threading.Thread(target=do_reading)
+        t2 = threading.Thread(target=do_release)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        rs, reading = results["reading"]
+        ls, release = results["release"]
+        event = reading["data"]["event"] if rs == 200 else None
+        if ls == 409 and release["error"]["code"] == "BATCH_BLOCKED":
+            # 事件先提交：放行被拦截，事件必须挂在该批次上
+            outcomes["blocked"] += 1
+            if not (event and event["batch_no"] == batch_no):
+                bad.append((i, "放行被拦截但事件未关联该批次", reading, release))
+        elif ls == 200:
+            # 放行先提交：事件绝不能挂到该已放行批次
+            s2, evs = call("GET", f"/api/events?batch_id={bid}")
+            attached = evs["data"]["events"]
+            outcomes["released_detached"] += 1
+            if not (event and event["batch_no"] != batch_no and attached == []):
+                bad.append((i, "放行成功但批次被补挂事件", reading, release, attached))
+        else:
+            bad.append((i, f"放行返回意外状态 {ls}", reading, release))
+    check(f"超限读数×放行并发 {rounds} 轮：每轮均为拦截或分离，无不一致", not bad, bad[:2])
+    print(f"        分布：放行被拦截 {outcomes['blocked']} 轮；放行成功且事件未挂该批次 {outcomes['released_detached']} 轮")
 
 
 def run_checks():
@@ -187,6 +244,9 @@ def run_checks():
 
     # ---- 并发：同一在产批次并发放行仅一次成功 ----
     concurrent_release_check()
+
+    # ---- 并发：超限读数与放行同时提交，拦截/分离二选一（多轮）----
+    reading_release_race_check()
 
 
 def main():
