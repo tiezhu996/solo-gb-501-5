@@ -458,10 +458,13 @@ def close_event(ctx):
     if blockers:
         raise ApiError(409, "EVENT_NOT_CLOSABLE", "事件不满足关闭条件：" + "；".join(blockers), {"blockers": blockers})
     operator = opt_str(ctx.body, "operator")
-    conn.execute(
-        "UPDATE events SET status='closed', closed_at=?, closed_by=? WHERE id=?",
+    cur = conn.execute(
+        "UPDATE events SET status='closed', closed_at=?, closed_by=? WHERE id=? AND status='open'",
         (now_str(), operator, ev["id"]),
     )
+    if cur.rowcount == 0:
+        # 并发下已被其他请求关闭
+        raise ApiError(409, "EVENT_CLOSED", f"事件 {ev['event_no']} 已关闭，请勿重复操作")
     return {"event": load_event(conn, ev["id"])}
 
 
@@ -492,7 +495,11 @@ def create_batch(ctx):
 
 @route("POST", r"/api/batches/(?P<id>\d+)/submit-release")
 def submit_release(ctx):
-    """提交放行：存在未关闭（含复测仍超限）事件的批次一律拦截。"""
+    """提交放行：存在未关闭（含复测仍超限）事件的批次一律拦截。
+
+    状态迁移为原子条件更新（WHERE status='in_production'）：并发提交同一批次时
+    仅一个请求生效，其余请求影响行数为 0，返回“已放行”提示。
+    """
     conn = ctx.conn
     bid = int(ctx.params["id"])
     batch = conn.execute("SELECT * FROM batches WHERE id=?", (bid,)).fetchone()
@@ -512,10 +519,13 @@ def submit_release(ctx):
             {"blocking_events": events},
         )
     operator = opt_str(ctx.body, "operator")
-    conn.execute(
-        "UPDATE batches SET status='released', released_at=?, released_by=? WHERE id=?",
+    cur = conn.execute(
+        "UPDATE batches SET status='released', released_at=?, released_by=? WHERE id=? AND status='in_production'",
         (now_str(), operator, bid),
     )
+    if cur.rowcount == 0:
+        # 并发下已被其他请求放行
+        raise ApiError(409, "ALREADY_RELEASED", f"批次 {batch['batch_no']} 已放行，请勿重复提交")
     return {"batch": load_batch(conn, bid)}
 
 

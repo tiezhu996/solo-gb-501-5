@@ -21,7 +21,16 @@ python3 server.py --reset
 端到端业务规则校验（独立临时实例，不影响正式数据）：
 
 ```bash
-python3 verify.py            # 31 项断言全部通过则退出码为 0
+python3 verify.py            # 34 项断言全部通过则退出码为 0
+```
+
+校验覆盖三部分：API 业务规则（拦截/复测/关闭/放行/输入校验）、页面真实渲染
+（`verify_pages.js` 以 DOM 桩加载真实 `static/app.js`，对运行中的服务逐页断言
+接口数据出现在页面上）、并发安全（8 线程并发放行同一批次，断言仅 1 次成功、
+其余收到已放行提示）。页面校验也可单独执行：
+
+```bash
+EMR_BASE=http://127.0.0.1:8000 node verify_pages.js
 ```
 
 ## 业务规则
@@ -32,6 +41,7 @@ python3 verify.py            # 31 项断言全部通过则退出码为 0
 4. **事件处置**：质量人员记录原因与纠正措施（未记录不能关闭）。
 5. **复测与关闭**：只有在事件下登记的**复测读数合格**后才能关闭事件；复测仍超限则事件保持未关闭并继续拦截。常规读数不改变事件状态。
 6. **已放行批次保护**：事件只关联在产批次，已放行批次永远不能被补挂事件；重复放行返回 `409 ALREADY_RELEASED`。
+7. **并发安全**：放行与事件关闭采用原子条件更新（`UPDATE ... WHERE status=...`）+ `busy_timeout`，并发提交同一批次仅一个请求成功，其余收到 `409 ALREADY_RELEASED`（事件关闭同理返回 `409 EVENT_CLOSED`）。
 
 ## 演示数据（覆盖四类场景）
 
@@ -93,11 +103,12 @@ curl -s -X POST http://localhost:8000/api/batches/1/submit-release \
 
 ```text
 sterile-env-monitoring/
-├── server.py      # HTTP 服务、路由、全部业务规则
-├── db.py          # SQLite schema 与连接
-├── seed.py        # 演示数据（幂等）
-├── verify.py      # 端到端业务规则校验（31 项断言）
-└── static/        # 前端（index.html / app.js / styles.css，无构建步骤）
+├── server.py        # HTTP 服务、路由、全部业务规则（含原子状态迁移）
+├── db.py            # SQLite schema 与连接（busy_timeout）
+├── seed.py          # 演示数据（幂等）
+├── verify.py        # 端到端校验：API 规则 + 页面渲染 + 并发（34 项断言）
+├── verify_pages.js  # 页面渲染校验（DOM 桩加载真实 app.js）
+└── static/          # 前端（index.html / app.js / styles.css，无构建步骤）
 ```
 
 数据文件 `data.db` 首次启动自动生成。与同目录下既有项目 `sterile-packaging-release-control`（Go/React，检验放行维度）相互独立，可并行运行（端口不冲突）。

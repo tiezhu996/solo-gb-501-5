@@ -89,6 +89,8 @@ def connect(db_path=None):
     conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 写锁冲突时等待而非立即报 database is locked，配合原子条件更新保证并发安全
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

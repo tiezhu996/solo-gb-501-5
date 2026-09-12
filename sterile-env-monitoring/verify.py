@@ -2,14 +2,17 @@
 """端到端业务规则校验：以临时数据库启动独立实例，逐项断言核心规则。
 
 用法：python3 verify.py
-覆盖：正常读数、超限自动事件、放行拦截、原因措施、复测仍超限继续拦截、
-      复测合格后关闭、关闭后放行成功、已放行批次不能补挂事件、输入校验。
+覆盖：页面真实渲染（node + 真实 app.js）、正常读数、超限自动事件、放行拦截、
+      原因措施、复测仍超限继续拦截、复测合格后关闭、关闭后放行成功、
+      已放行批次不能补挂事件、并发提交放行仅一次成功、输入校验。
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +42,47 @@ def check(name, cond, extra=""):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}" + ("" if cond else f"  -> {extra}"))
 
 
+def run_page_checks():
+    """用真实 app.js（DOM 桩）对运行中的服务渲染各页面并断言内容。"""
+    node = shutil.which("node")
+    if not node:
+        print("  SKIP  页面渲染校验（未找到 node，跳过）")
+        return True
+    env = dict(os.environ, EMR_BASE=BASE)
+    proc = subprocess.run(
+        [node, os.path.join(HERE, "verify_pages.js")],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    return proc.returncode == 0
+
+
+def concurrent_release_check():
+    """8 个线程同时提交同一在产批次放行：应仅 1 次成功，其余收到已放行提示。"""
+    s, r = call("POST", "/api/batches",
+                {"line_id": 1, "batch_no": "B2026-CONC", "product_name": "并发放行验证批次", "spec": "1ml × 1000 支"})
+    bid = r["data"]["batch"]["id"]
+    results = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        results.append(call("POST", f"/api/batches/{bid}/submit-release", {"operator": "王质量"}))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    oks = [x for x in results if x[0] == 200]
+    already = [x for x in results if x[0] == 409 and x[1].get("error", {}).get("code") == "ALREADY_RELEASED"]
+    check("并发提交放行：仅 1 次成功", len(oks) == 1, [x[0] for x in results])
+    check("并发提交放行：其余 7 次收到已放行提示", len(already) == 7,
+          [(x[0], x[1].get("error", {}).get("code")) for x in results])
+
+
 def run_checks():
     # ---- 页面与静态资源 ----
     s, _ = call("GET", "/api/health")
@@ -64,12 +108,15 @@ def run_checks():
     check("B2026-0903 读数正常、可放行", b3["can_release"] is True, b3)
     check("B2026-0831 为已放行批次", b4["status"] == "released", b4)
 
-    # ---- 放行拦截：未关闭事件阻止提交放行 ----
+    # ---- 放行拦截：未关闭事件阻止提交放行（不改变状态）----
     s, r = call("POST", f"/api/batches/{b1['id']}/submit-release", {"operator": "王质量"})
     check("未关闭事件拦截批次提交放行（409 BATCH_BLOCKED）",
           s == 409 and r["error"]["code"] == "BATCH_BLOCKED", r)
     blocking = r["error"]["details"]["blocking_events"]
     check("拦截响应列出未关闭事件", len(blocking) == 1 and blocking[0]["status"] == "open", blocking)
+
+    # ---- 页面渲染校验（需在变更类检查之前，保持种子状态）----
+    check("页面渲染校验（真实 app.js + 接口数据）", run_page_checks())
 
     # ---- 正常读数：合格、不生成事件 ----
     s, points = call("GET", "/api/points")
@@ -137,6 +184,9 @@ def run_checks():
     check("未设限值的监测点被拒绝（400）", s == 400, r)
     s, r = call("POST", "/api/readings", {"point_id": pts["P-HUM-01"]["id"], "value": "abc"})
     check("非数字读数被拒绝（400）", s == 400, r)
+
+    # ---- 并发：同一在产批次并发放行仅一次成功 ----
+    concurrent_release_check()
 
 
 def main():

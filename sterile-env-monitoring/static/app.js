@@ -160,7 +160,7 @@ function batchReadinessTable(batches) {
 /* ---------------- 页面：监测点 ---------------- */
 
 async function renderPoints() {
-  const [points, lines] = await Promise.all([api('/api/points'), api('/api/lines')]);
+  const [{ points }, { lines }] = await Promise.all([api('/api/points'), api('/api/lines')]);
   $('#app').innerHTML = `
     <section class="panel">
       <div class="panel-head"><h2>监测点（关联产线与限值）</h2><span class="sub">共 ${points.length} 个</span></div>
@@ -230,7 +230,7 @@ async function renderPoints() {
 /* ---------------- 页面：读数登记 ---------------- */
 
 async function renderReadings() {
-  const [points, readings] = await Promise.all([api('/api/points'), api('/api/readings?limit=30')]);
+  const [{ points }, { readings }] = await Promise.all([api('/api/points'), api('/api/readings?limit=30')]);
   const result = state.readingResult;
   $('#app').innerHTML = `
     <section class="panel">
@@ -302,7 +302,7 @@ function readingResultHtml(data) {
 
 async function renderEvents() {
   const q = state.eventsFilter === 'all' ? '' : `?status=${state.eventsFilter}`;
-  const events = await api('/api/events' + q);
+  const { events } = await api('/api/events' + q);
   let detail = null;
   if (state.selectedEventId) {
     try {
@@ -462,7 +462,7 @@ function bindEventDetail(ev) {
 /* ---------------- 页面：批次放行 ---------------- */
 
 async function renderBatches() {
-  const [batches, lines] = await Promise.all([api('/api/batches'), api('/api/lines')]);
+  const [{ batches }, { lines }] = await Promise.all([api('/api/batches'), api('/api/lines')]);
   const re = state.releaseError;
   $('#app').innerHTML = `
     ${re ? `<div class="alert alert-red">
