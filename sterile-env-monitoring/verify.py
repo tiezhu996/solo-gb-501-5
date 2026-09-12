@@ -17,7 +17,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-
 PORT = 8123
 BASE = f"http://127.0.0.1:{PORT}"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -270,7 +269,12 @@ def main():
         run_checks()
     finally:
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(tmp, ignore_errors=True)
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} 项通过")
     return 1 if failed else 0
